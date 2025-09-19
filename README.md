@@ -10,7 +10,7 @@ Stops are represented as **ERC1155 tokens**, giving users transferable ownership
 
 ---
 🚀 Impact
-
+---
 TickForge enables DeFi traders and LPs to automate risk management directly on-chain.
 By introducing trailing stops into Uniswap V4, the project:
 
@@ -21,6 +21,7 @@ Protects users from sharp reversals.
 Improves capital efficiency by letting profits run while capping downside.
 
 Lays groundwork for advanced automated strategies (vaults, managed LP positions, solver integrations).
+
 ---
 
 ## ✨ Features
