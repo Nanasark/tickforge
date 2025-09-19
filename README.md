@@ -9,9 +9,18 @@ Stops are represented as **ERC1155 tokens**, giving users transferable ownership
 > Inspired by traditional finance trailing stops, TickForge bridges familiar risk management tools into DeFi while leveraging the flexibility of Uniswap V4.
 
 ---
+🚀 Impact
 
-⚡ **Note on repo history:** This project was forked from a template to speed up setup. All Hook-specific logic — including the `TickForge` contracts, trailing stop functionality, and test cases — were newly written by **Daniel Ayensu** for this project.
+TickForge enables DeFi traders and LPs to automate risk management directly on-chain.
+By introducing trailing stops into Uniswap V4, the project:
 
+Reduces the need for constant monitoring.
+
+Protects users from sharp reversals.
+
+Improves capital efficiency by letting profits run while capping downside.
+
+Lays groundwork for advanced automated strategies (vaults, managed LP positions, solver integrations).
 ---
 
 ## ✨ Features
