@@ -1,0 +1,328 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Test} from "forge-std/Test.sol";
+import {console} from "forge-std/console.sol";
+import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
+import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
+import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
+import {PoolId as PoolIdCore} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {PoolKey as PoolKeyCore} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
+import {MockERC20} from "./MockERC20.sol";
+import {MockPyth} from "@pythnetwork/pyth-sdk-solidity/MockPyth.sol";
+import {HookMiner} from "test/utils/HookMiner.sol";
+import {EasyPosm} from "./utils/libraries/EasyPosm.sol";
+import {TickForge} from "../src/TickForge.sol";
+import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+
+contract TickForgeTest is Test, Deployers {
+    using PoolIdLibrary for PoolKey;
+    using CurrencyLibrary for Currency;
+    using SafeCast for uint256;
+
+    // Test contracts
+    TickForge public hook;
+    IPoolManager public poolManager;
+
+    // Test tokens
+    MockERC20 public token0;
+    MockERC20 public token1;
+
+    // Pyth mock
+    MockPyth public mockPyth;
+    bytes32 public priceFeedId = bytes32(uint256(1));
+
+    // Test addresses
+    address public owner;
+    address public user;
+
+    // Pool key and ID
+    PoolKey public poolKey;
+    PoolId public poolId;
+
+    // Constants
+    uint256 constant INITIAL_BALANCE = 10000e18;
+
+    // Tick threshold for stop
+    int24 public thresholdTick = 100;
+
+function setUp() public {
+    // Deploy Uniswap V4 core contracts
+    deployFreshManagerAndRouters();
+    poolManager = IPoolManager(address(manager));
+
+    // Deploy mock tokens
+    token0 = new MockERC20(18);
+    token1 = new MockERC20(18);
+    if (address(token0) > address(token1)) {
+        (token0, token1) = (token1, token0);
+    }
+
+    owner = makeAddr("owner");
+    user = makeAddr("user");
+    token0.mint(address(this), INITIAL_BALANCE);
+    token1.mint(address(this), INITIAL_BALANCE);
+    token0.mint(user, INITIAL_BALANCE);
+    token1.mint(user, INITIAL_BALANCE);
+
+    // Deploy MockPyth
+    mockPyth = new MockPyth(60, 1);
+
+    // Hook flags
+    uint160 hookFlags = uint160(Hooks.AFTER_SWAP_FLAG);
+
+    // Prepare constructor args for TickForge
+    bytes memory constructorArgs = abi.encode(
+        manager,
+        "https://tickforge.io/metadata/", // URI
+        address(mockPyth),
+        priceFeedId
+    );
+
+
+    // Use HookMiner.find to compute address + salt
+    bytes memory creationCode = type(TickForge).creationCode;
+    (address hookAddress, bytes32 salt) = HookMiner.find(
+        address(this),
+        hookFlags,
+        creationCode,
+        constructorArgs
+    );
+
+    // Actually deploy TickForge using CREATE2 and salt
+    hook = new TickForge{salt: salt}(
+        manager,
+        "https://tickforge.io/metadata/",
+        address(mockPyth),
+        priceFeedId
+    );
+
+    // Build pool with hook
+    poolKey = PoolKey({
+        currency0: Currency.wrap(address(token0)),
+        currency1: Currency.wrap(address(token1)),
+        fee: 3000,
+        tickSpacing: 60,
+        hooks: IHooks(hook)
+    });
+    poolId = poolKey.toId();
+
+    uint160 sqrtPrice = TickMath.getSqrtPriceAtTick(0);
+    poolManager.initialize(poolKey, sqrtPrice);
+
+    token0.approve(address(modifyLiquidityRouter), type(uint256).max);
+    token1.approve(address(modifyLiquidityRouter), type(uint256).max);
+
+    modifyLiquidityRouter.modifyLiquidity{value: 0}(
+        poolKey,
+        ModifyLiquidityParams({
+            tickLower: -120,
+            tickUpper: 120,
+            liquidityDelta: 1000e18,
+            salt: bytes32(0)
+        }),
+        ""
+    );
+
+    uint128 liq = StateLibrary.getLiquidity(poolManager, poolId);
+    assertTrue(liq > 0, "Pool should have liquidity");
+
+    token0.approve(address(swapRouter), type(uint256).max);
+    token1.approve(address(swapRouter), type(uint256).max);
+}
+
+
+    function test_CreateStopAndTrigger() public {
+        uint256 depositAmount = 10e18;
+
+        // User approves TickForge hook to spend token0
+        vm.startPrank(user);
+        token0.approve(address(hook), depositAmount);
+
+        // Update MockPyth price to avoid stale revert (set price to 1:1)
+        bytes[] memory priceUpdate = new bytes[](1);
+        priceUpdate[0] = mockPyth.createPriceFeedUpdateData(
+            priceFeedId,
+            100 * 1e5, // price
+            1 * 1e5,   // confidence
+            -2,        // exponent
+            100 * 1e5, // emaPrice
+            1 * 1e5,   // emaConfidence
+            uint64(block.timestamp),
+            uint64(block.timestamp)
+        );
+        uint256 updateFee = mockPyth.getUpdateFee(priceUpdate);
+        vm.deal(user, updateFee);
+        vm.prank(user);
+        mockPyth.updatePriceFeeds{ value: updateFee }(priceUpdate);
+
+        // User creates stop: sell token0 when pool tick >= thresholdTick
+        uint256 tokenId = hook.createStop{value: hook.EXECUTION_GAS_FEE()}
+        (
+            poolKey, thresholdTick, false, depositAmount, 1e18, 50
+        );
+
+        // Hook contract should hold the deposited token0
+        assertEq(token0.balanceOf(address(hook)), depositAmount, "Hook should hold deposit");
+
+        // Perform a small swap that should NOT trigger the stop
+        // Swap a small amount of token1 for token0 (price rises slightly)
+       SwapParams memory paramsSmall = SwapParams({
+            zeroForOne: false,
+            amountSpecified: -1e18,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        PoolSwapTest.TestSettings memory settings = PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        });
+        swapRouter.swap(poolKey, paramsSmall, settings, "");
+        // After small swap, stop should not trigger
+        assertEq(token0.balanceOf(address(hook)), depositAmount, "Stop should not have triggered");
+        // Claim should revert (nothing to claim)
+        vm.expectRevert();
+        vm.prank(user);
+        hook.claimProceeds(tokenId);
+
+        // Perform a large swap to move tick beyond threshold
+        SwapParams memory paramsLarge = SwapParams({
+            zeroForOne: false,
+            amountSpecified: -100e18,
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        });
+        swapRouter.swap(poolKey, paramsLarge, settings, "");
+        ( , , , , bool triggered, bool executed) = hook.getStopDetails(tokenId);
+        assertTrue(triggered, "Stop should be triggered");
+        if (!executed) {
+            vm.prank(user);
+            hook.executeStop(tokenId);
+        }
+
+        // After triggering swap, stop should be triggered and token0 sold
+        uint256 hookToken0After = token0.balanceOf(address(hook));
+        uint256 hookToken1After = token1.balanceOf(address(hook));
+        assertEq(hookToken0After, 0, "Hook should no longer hold token0 after trigger");
+        assertTrue(hookToken1After > 0, "Hook should hold proceeds in token1");
+
+        // User claims proceeds
+        uint256 userBalanceBefore = token1.balanceOf(user);
+        vm.prank(user);
+        hook.claimProceeds(tokenId);
+        uint256 userBalanceAfter = token1.balanceOf(user);
+        assertTrue(userBalanceAfter > userBalanceBefore, "User should receive token1 proceeds");
+        // Hook should have no token1 after claim
+        assertEq(token1.balanceOf(address(hook)), 0, "Hook should have no token1 after claim");
+    }
+
+    function test_CancelStopAndNoTrigger() public {
+        uint256 depositAmount = 5e18;
+
+        // Update MockPyth price
+        bytes[] memory priceUpdate = new bytes[](1);
+        priceUpdate[0] = mockPyth.createPriceFeedUpdateData(
+            priceFeedId,
+            50 * 1e5,
+            1 * 1e5,
+            -2,
+            50 * 1e5,
+            1 * 1e5,
+            uint64(block.timestamp),
+            uint64(block.timestamp)
+        );
+        uint256 updateFee = mockPyth.getUpdateFee(priceUpdate);
+        vm.deal(user, updateFee);
+        vm.prank(user);
+        mockPyth.updatePriceFeeds{ value: updateFee }(priceUpdate);
+
+        // User approves and creates stop
+        vm.startPrank(user);
+        token0.approve(address(hook), depositAmount);
+        uint256 tokenId = hook.createStop{value: hook.EXECUTION_GAS_FEE()}
+        (
+            poolKey, thresholdTick, false, depositAmount, 1e18, 50
+        );
+
+        vm.stopPrank();
+
+        // User cancels the stop
+        vm.startPrank(user);
+        hook.cancelStop(tokenId);
+
+        // Deposit should be refunded to user
+assertEq(token0.balanceOf(user), INITIAL_BALANCE, "User should be refunded");
+
+        // Further swaps should not trigger anything (claim reverts)
+        SwapParams memory params = SwapParams({
+            zeroForOne: false,
+            amountSpecified: -50e18,
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        });
+        swapRouter.swap(poolKey, params, PoolSwapTest.TestSettings({ takeClaims: false, settleUsingBurn: false }), "");
+        vm.expectRevert();
+        vm.prank(user);
+ 
+
+        hook.claimProceeds(tokenId);
+    }
+
+    function test_PythPriceStalenessPreventsStop() public {
+        uint256 depositAmount = 35e18;
+        vm.startPrank(user);
+        token0.approve(address(hook), depositAmount);
+
+        // Without updating price, createStop should revert due to stale price
+        vm.expectRevert();
+        hook.createStop(poolKey, thresholdTick, false, depositAmount,1e18,50);
+        vm.stopPrank();
+    }
+
+    function test_PythUpdateAllowsStop() public {
+        uint256 depositAmount = 35e18;
+
+        // Update MockPyth price
+        bytes[] memory priceUpdate = new bytes[](1);
+        priceUpdate[0] = mockPyth.createPriceFeedUpdateData(
+            priceFeedId,
+            150 * 1e5,
+            1 * 1e5,
+            -2,
+            150 * 1e5,
+            1 * 1e5,
+            uint64(block.timestamp),
+            uint64(block.timestamp)
+        );
+        uint256 updateFee = mockPyth.getUpdateFee(priceUpdate);
+         vm.warp(block.timestamp + 1);
+        vm.deal(user, updateFee);
+        vm.prank(user);
+      
+        mockPyth.updatePriceFeeds{ value: updateFee }(priceUpdate);
+
+        // Now creation should not revert
+        vm.startPrank(user);
+        token0.approve(address(hook), depositAmount);
+        uint256 tokenId = hook.createStop{value: hook.EXECUTION_GAS_FEE()}
+        (
+            poolKey, thresholdTick, false, depositAmount, 1e18, 50
+        );
+
+        vm.stopPrank();
+
+        // Clean up: cancel stop
+        vm.prank(user);
+        hook.cancelStop(tokenId);
+    }
+}
+

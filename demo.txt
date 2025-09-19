@@ -1,0 +1,13 @@
+No files changed, compilation skipped
+
+Ran 1 test for test/TickForgeTest.t.sol:TickForgeTest
+[PASS] test_CreateAndCancelStop() (gas: 328694)
+Logs:
+  User token0 balance after liquidity: 999941767358693748060545
+  User token1 balance after liquidity: 999941767358693748060545
+  Pool initial tick: 0
+  Pool liquidity: 1000000000000000000000
+
+Suite result: ok. 1 passed; 0 failed; 0 skipped; finished in 111.21ms (761.90µs CPU time)
+
+Ran 1 test suite in 117.50ms (111.21ms CPU time): 1 tests passed, 0 failed, 0 skipped (1 total tests)

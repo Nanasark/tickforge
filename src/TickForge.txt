@@ -1,0 +1,516 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {BaseHook} from "@openzeppelin/uniswap-hooks/src/base/BaseHook.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {ERC1155} from "openzeppelin-contracts/contracts/token/ERC1155/ERC1155.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {IPyth} from "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
+import {PythStructs} from "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
+import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+
+contract TickForge is BaseHook, ERC1155, IUnlockCallback {
+    using PoolIdLibrary for PoolKey;
+    using CurrencyLibrary for Currency;
+    using StateLibrary for IPoolManager;
+
+    // Events
+    event StopCreated(uint256 indexed tokenId, address indexed owner);
+    event StopTriggered(uint256 indexed tokenId, int24 triggerTick);
+    event StopExecuted(uint256 indexed tokenId, uint256 outputAmount);
+    event StopCancelled(uint256 indexed tokenId);
+    event ExecutionFailed(uint256 indexed tokenId, string reason);
+    
+    // Errors
+    error ZeroAmount();
+    error InvalidParameters();
+    error NotOwner();
+    error TransferFailed();
+    error OracleFailure();
+    error InsufficientBalance();
+
+    // Constants
+    IPyth public immutable pyth;
+    bytes32 public immutable priceFeedId;
+    uint256 public immutable deploymentTimestamp;
+    uint256 public constant ORACLE_STALENESS_THRESHOLD = 300;
+    uint256 public constant EXECUTION_GAS_FEE = 0.001 ether;
+    uint256 public constant MAX_STOPS_PER_SWAP = 5; // Reduced for gas
+    uint256 public constant EMERGENCY_DELAY = 30 days;
+
+    // Packed structs to reduce stack pressure
+    struct StopData {
+        address owner;
+        uint128 inputAmount;
+        uint128 outputAmount;
+        bool direction;
+        bool triggered;
+        bool executed;
+    }
+
+    struct StopConfig {
+        int24 lastTick;
+        int24 threshold;
+        uint128 minOutputAmount;
+        uint128 executionGasFee;
+        uint64 createdAt;
+        uint64 oraclePriceThreshold;
+    }
+
+    struct OracleData {
+        uint128 lastOraclePrice;
+        uint128 reserved; // for future use
+    }
+
+    // Storage - split to reduce struct size
+    mapping(uint256 => StopData) public stopData;
+    mapping(uint256 => StopConfig) public stopConfig;
+    mapping(uint256 => OracleData) public oracleData;
+    mapping(uint256 => PoolKey) public stopKeys;
+    mapping(PoolId => uint256[]) public poolStopIds;
+    mapping(PoolId => mapping(uint256 => uint256)) public stopIndexInPool;
+    mapping(PoolId => uint256) public processingOffset;
+    mapping(uint256 => bool) private _locks;
+    uint256 public nextTokenId;
+
+    // Reentrancy modifier
+    modifier nonReentrant(uint256 tokenId) {
+        require(!_locks[tokenId], "Locked");
+        _locks[tokenId] = true;
+        _;
+        _locks[tokenId] = false;
+    }
+
+    constructor(
+        IPoolManager _poolManager,
+        string memory _uri,
+        address _pyth,
+        bytes32 _priceFeedId
+    ) BaseHook(_poolManager) ERC1155(_uri) {
+        pyth = IPyth(_pyth);
+        priceFeedId = _priceFeedId;
+        deploymentTimestamp = block.timestamp;
+    }
+
+    
+    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
+        return Hooks.Permissions({
+            beforeInitialize: false,
+            afterInitialize: false,
+            beforeAddLiquidity: false,
+            afterAddLiquidity: false,
+            beforeRemoveLiquidity: false,
+            afterRemoveLiquidity: false,
+            beforeSwap: false,
+            afterSwap: true,
+            beforeDonate: false,
+            afterDonate: false,
+            beforeSwapReturnDelta: false,
+            afterSwapReturnDelta: false,
+            afterAddLiquidityReturnDelta: false,
+            afterRemoveLiquidityReturnDelta: false
+        });
+    }
+
+    function createStop(
+        PoolKey calldata key,
+        int24 threshold,
+        bool direction,
+        uint256 amount,
+        uint256 minOutputAmount,
+        uint256 oraclePriceThreshold
+    ) external payable returns (uint256 tokenId) {
+        if (amount == 0) revert ZeroAmount();
+        if (threshold <= 0 || oraclePriceThreshold == 0) revert InvalidParameters();
+        if (msg.value < EXECUTION_GAS_FEE) revert("Insufficient fee");
+        
+        tokenId = nextTokenId++;
+        
+        // Get current state
+        PoolId poolId = key.toId();
+        (, int24 currentTick, , ) = poolManager.getSlot0(poolId);
+        uint256 currentOraclePrice = _validateOraclePrice();
+        
+        // Store data in separate mappings
+        stopData[tokenId] = StopData({
+            owner: msg.sender,
+            inputAmount: uint128(amount),
+            outputAmount: 0,
+            direction: direction,
+            triggered: false,
+            executed: false
+        });
+        
+        stopConfig[tokenId] = StopConfig({
+            lastTick: currentTick,
+            threshold: threshold,
+            minOutputAmount: uint128(minOutputAmount),
+            executionGasFee: uint128(EXECUTION_GAS_FEE),
+            createdAt: uint64(block.timestamp),
+            oraclePriceThreshold: uint64(oraclePriceThreshold)
+        });
+        
+        oracleData[tokenId] = OracleData({
+            lastOraclePrice: uint128(currentOraclePrice),
+            reserved: 0
+        });
+        
+        stopKeys[tokenId] = key;
+        
+        // Pool tracking
+        stopIndexInPool[poolId][tokenId] = poolStopIds[poolId].length;
+        poolStopIds[poolId].push(tokenId);
+        
+        // Token operations
+        _transferAndMint(key, direction, amount, tokenId);
+        
+        // Refund excess
+        if (msg.value > EXECUTION_GAS_FEE) {
+            payable(msg.sender).transfer(msg.value - EXECUTION_GAS_FEE);
+        }
+        
+        emit StopCreated(tokenId, msg.sender);
+    }
+
+    function _transferAndMint(PoolKey calldata key, bool direction, uint256 amount, uint256 tokenId) internal {
+        address tokenIn = direction ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
+        
+        // Fixed: Check return value for transferFrom
+        bool success = IERC20(tokenIn).transferFrom(msg.sender, address(this), amount);
+        if (!success) revert TransferFailed();
+        
+        _mint(msg.sender, tokenId, amount, "");
+    }
+
+    function cancelStop(uint256 tokenId) external nonReentrant(tokenId) {
+        StopData storage data = stopData[tokenId];
+        if (data.owner != msg.sender) revert NotOwner();
+        if (data.executed) revert("Already executed");
+        if (balanceOf(msg.sender, tokenId) < data.inputAmount) revert InsufficientBalance();
+        
+        _cancelStopInternal(tokenId);
+        emit StopCancelled(tokenId);
+    }
+
+    function _cancelStopInternal(uint256 tokenId) internal {
+        StopData storage data = stopData[tokenId];
+        StopConfig storage config = stopConfig[tokenId];
+        PoolKey memory key = stopKeys[tokenId];
+        
+        // Remove from tracking
+        _removeStopFromPool(key.toId(), tokenId);
+        
+        uint256 refund = data.inputAmount;
+        uint256 gasRefund = config.executionGasFee;
+        address tokenIn = data.direction ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
+        
+        // Clear state
+        data.owner = address(0);
+        data.inputAmount = 0;
+        
+        // Transfers with return value checks
+        _burn(msg.sender, tokenId, refund);
+        
+        // Fixed: Check return value for transfer
+        bool success = IERC20(tokenIn).transfer(msg.sender, refund);
+        if (!success) revert TransferFailed();
+        
+        if (gasRefund > 0) {
+            payable(msg.sender).transfer(gasRefund);
+        }
+    }
+
+    function claimProceeds(uint256 tokenId) external nonReentrant(tokenId) {
+        StopData storage data = stopData[tokenId];
+        
+        if (data.owner != msg.sender) revert NotOwner();
+        if (!data.executed) revert("Not executed");
+        if (data.outputAmount == 0) revert("No proceeds");
+        if (balanceOf(msg.sender, tokenId) < data.inputAmount) revert InsufficientBalance();
+        
+        _claimInternal(tokenId);
+    }
+
+    function _claimInternal(uint256 tokenId) internal {
+        StopData storage data = stopData[tokenId];
+        PoolKey memory key = stopKeys[tokenId];
+        
+        uint256 claimAmount = data.outputAmount;
+        uint256 burnAmount = data.inputAmount;
+        address tokenOut = data.direction ? Currency.unwrap(key.currency1) : Currency.unwrap(key.currency0);
+        
+        // Clear state
+        data.outputAmount = 0;
+        data.owner = address(0);
+        
+        // Transfers
+        _burn(msg.sender, tokenId, burnAmount);
+        
+        // Fixed: Check return value for transfer
+        bool success = IERC20(tokenOut).transfer(msg.sender, claimAmount);
+        if (!success) revert TransferFailed();
+    }
+
+    function afterSwap(
+        address,
+        PoolKey calldata key,
+        SwapParams calldata,
+        BalanceDelta,
+        bytes calldata
+    ) external override returns (bytes4, int128) {
+        PoolId poolId = key.toId();
+        (, int24 currentTick, , ) = poolManager.getSlot0(poolId);
+        
+        uint256 currentOraclePrice;
+        bool oracleValid;
+        
+        try this._getOraclePrice() returns (uint256 price) {
+            currentOraclePrice = price;
+            oracleValid = true;
+        } catch {
+            oracleValid = false;
+        }
+        
+        if (oracleValid) {
+            _processStops(poolId, currentTick, currentOraclePrice);
+        }
+        
+        return (BaseHook.afterSwap.selector, 0);
+    }
+
+    function _processStops(PoolId poolId, int24 currentTick, uint256 currentOraclePrice) internal {
+        uint256[] storage stops = poolStopIds[poolId];
+        uint256 len = stops.length;
+        
+        if (len == 0) return;
+        
+        uint256 offset = processingOffset[poolId];
+        uint256 processed;
+        
+        for (uint256 i; i < len && processed < MAX_STOPS_PER_SWAP; i++) {
+            uint256 idx = (offset + i) % len;
+            uint256 tokenId = stops[idx];
+            
+            if (_shouldExecute(tokenId, currentTick, currentOraclePrice)) {
+                _executeStop(tokenId, currentTick);
+            }
+            
+            processed++;
+        }
+        
+        processingOffset[poolId] = (offset + processed) % len;
+    }
+
+    function _shouldExecute(uint256 tokenId, int24 currentTick, uint256 currentOraclePrice) internal returns (bool) {
+        StopData storage data = stopData[tokenId];
+        if (data.owner == address(0) || data.executed) return false;
+        
+        StopConfig storage config = stopConfig[tokenId];
+        OracleData storage oracle = oracleData[tokenId];
+        
+        // Check tick trigger
+        bool tickTriggered;
+        if (data.direction) {
+            if (currentTick > config.lastTick) {
+                config.lastTick = currentTick;
+            } else {
+                tickTriggered = (config.lastTick - currentTick) >= config.threshold;
+            }
+        } else {
+            if (currentTick < config.lastTick) {
+                config.lastTick = currentTick;
+            } else {
+                tickTriggered = (currentTick - config.lastTick) >= config.threshold;
+            }
+        }
+        
+        if (!tickTriggered) return false;
+        
+        // Check oracle trigger
+        bool oracleTriggered;
+        if (data.direction) {
+            if (currentOraclePrice > oracle.lastOraclePrice) {
+                oracle.lastOraclePrice = uint128(currentOraclePrice);
+            } else {
+                uint256 drop = ((oracle.lastOraclePrice - currentOraclePrice) * 10000) / oracle.lastOraclePrice;
+                oracleTriggered = drop >= config.oraclePriceThreshold;
+            }
+        } else {
+            if (currentOraclePrice < oracle.lastOraclePrice) {
+                oracle.lastOraclePrice = uint128(currentOraclePrice);
+            } else {
+                uint256 rise = ((currentOraclePrice - oracle.lastOraclePrice) * 10000) / oracle.lastOraclePrice;
+                oracleTriggered = rise >= config.oraclePriceThreshold;
+            }
+        }
+        
+        return oracleTriggered;
+    }
+
+    function _executeStop(uint256 tokenId, int24 currentTick) internal {
+        stopData[tokenId].triggered = true;
+        emit StopTriggered(tokenId, currentTick);
+        
+        try this._performSwap(tokenId) {
+            _removeStopFromPool(stopKeys[tokenId].toId(), tokenId);
+        } catch Error(string memory reason) {
+            emit ExecutionFailed(tokenId, reason);
+        }
+    }
+
+    function _performSwap(uint256 tokenId) external {
+        require(msg.sender == address(this), "Internal only");
+        
+        StopData storage data = stopData[tokenId];
+        PoolKey memory key = stopKeys[tokenId];
+        
+        SwapParams memory params = SwapParams({
+            zeroForOne: data.direction,
+            amountSpecified: int256(uint256(data.inputAmount)),
+            sqrtPriceLimitX96: data.direction ? 
+                TickMath.MIN_SQRT_PRICE + 1 : 
+                TickMath.MAX_SQRT_PRICE - 1
+        });
+        
+        poolManager.unlock(abi.encode(key, params, tokenId));
+    }
+
+    function executeStop(uint256 tokenId) external nonReentrant(tokenId) {
+        StopData storage data = stopData[tokenId];
+        if (data.owner != msg.sender) revert NotOwner();
+        if (data.executed) revert("Already executed");
+
+        int24 currentTick;
+        uint256 currentOraclePrice;
+        bool shouldTrigger = false;
+
+        if (!data.triggered) {
+            PoolId poolId = stopKeys[tokenId].toId();
+            (, currentTick, , ) = poolManager.getSlot0(poolId);
+            currentOraclePrice = _validateOraclePrice();
+            shouldTrigger = _shouldExecute(tokenId, currentTick, currentOraclePrice);
+            if (!shouldTrigger) revert("Not triggered");
+            data.triggered = true;
+            emit StopTriggered(tokenId, currentTick);
+        }
+
+        this._performSwap(tokenId);
+        _removeStopFromPool(stopKeys[tokenId].toId(), tokenId);
+    }
+
+    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
+        require(msg.sender == address(poolManager), "Not PoolManager");
+        
+        (PoolKey memory key, SwapParams memory params, uint256 tokenId) = 
+            abi.decode(data, (PoolKey, SwapParams, uint256));
+        
+        _executeSwap(key, params, tokenId);
+        return "";
+    }
+
+    function _executeSwap(PoolKey memory key, SwapParams memory params, uint256 tokenId) internal {
+        StopData storage data = stopData[tokenId];
+        StopConfig storage config = stopConfig[tokenId];
+        
+        BalanceDelta delta = poolManager.swap(key, params, "");
+        
+        Currency inputCurrency = data.direction ? key.currency0 : key.currency1;
+        Currency outputCurrency = data.direction ? key.currency1 : key.currency0;
+        
+        int128 inputDelta = data.direction ? delta.amount0() : delta.amount1();
+        int128 outputDelta = data.direction ? delta.amount1() : delta.amount0();
+        
+        uint256 inputAmount = uint256(uint128(-inputDelta));
+        uint256 outputAmount = uint256(uint128(outputDelta));
+        
+        require(outputAmount >= config.minOutputAmount, "Slippage");
+        
+        // Settlement
+        poolManager.take(inputCurrency, address(poolManager), inputAmount);
+        poolManager.settle();
+        poolManager.take(outputCurrency, address(this), outputAmount);
+        
+        // Update state
+        data.executed = true;
+        data.outputAmount = uint128(outputAmount);
+        
+        emit StopExecuted(tokenId, outputAmount);
+    }
+
+    function _validateOraclePrice() internal view returns (uint256) {
+        PythStructs.Price memory price = pyth.getPriceUnsafe(priceFeedId);
+        
+        if (price.publishTime < block.timestamp - ORACLE_STALENESS_THRESHOLD) {
+            revert("Stale price");
+        }
+        if (price.price <= 0) revert("Invalid price");
+        
+        if (price.expo >= 0) {
+            return uint256(uint64(price.price)) * (10 ** uint256(int256(price.expo)));
+        } else {
+            return uint256(uint64(price.price)) / (10 ** uint256(int256(-price.expo)));
+        }
+    }
+
+    function _getOraclePrice() external view returns (uint256) {
+        return _validateOraclePrice();
+    }
+
+    function _removeStopFromPool(PoolId poolId, uint256 tokenId) internal {
+        uint256[] storage stops = poolStopIds[poolId];
+        uint256 index = stopIndexInPool[poolId][tokenId];
+        uint256 lastIndex = stops.length - 1;
+        
+        if (index != lastIndex) {
+            uint256 lastTokenId = stops[lastIndex];
+            stops[index] = lastTokenId;
+            stopIndexInPool[poolId][lastTokenId] = index;
+        }
+        
+        stops.pop();
+        delete stopIndexInPool[poolId][tokenId];
+    }
+
+    // View functions
+    function getStopDetails(uint256 tokenId) external view returns (
+        address owner,
+        uint256 inputAmount,
+        uint256 outputAmount,
+        bool direction,
+        bool triggered,
+        bool executed
+    ) {
+        StopData memory data = stopData[tokenId];
+        return (data.owner, data.inputAmount, data.outputAmount, data.direction, data.triggered, data.executed);
+    }
+
+    function uri(uint256 tokenId) public pure override returns (string memory) {
+        return string(abi.encodePacked("https://tickforge.io/metadata/", _toString(tokenId)));
+    }
+
+    function _toString(uint256 value) internal pure returns (string memory) {
+        if (value == 0) return "0";
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits -= 1;
+            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+            value /= 10;
+        }
+        return string(buffer);
+    }
+
+    receive() external payable {}
+}
